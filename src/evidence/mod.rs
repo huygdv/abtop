@@ -311,6 +311,7 @@ fn session_status_label(status: &SessionStatus) -> &'static str {
         SessionStatus::Executing => "working",
         SessionStatus::Waiting => "waiting",
         SessionStatus::RateLimited => "rate-limited",
+        SessionStatus::Unknown => "unknown",
         SessionStatus::Done => "done",
     }
 }
@@ -321,6 +322,7 @@ fn idle_text(status: &SessionStatus) -> &'static str {
         SessionStatus::Executing => "working",
         SessionStatus::Waiting => "waiting",
         SessionStatus::RateLimited => "rate-limited",
+        SessionStatus::Unknown => "unknown",
         SessionStatus::Done => "done",
     }
 }
@@ -409,6 +411,7 @@ mod tests {
             current_tasks: vec!["Bash cargo test -- --nocapture".into()],
             mem_mb: 0,
             version: String::new(),
+            config_root: String::new(),
             git_branch: String::new(),
             git_added: 0,
             git_modified: 0,

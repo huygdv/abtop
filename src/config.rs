@@ -76,6 +76,9 @@ pub struct AppConfig {
     /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
+    /// Additional Claude config directories to scan for sessions.
+    /// Useful for multi-profile setups that use separate CLAUDE_CONFIG_DIR roots.
+    pub claude_config_dirs: Vec<PathBuf>,
     pub panels: PanelVisibility,
     pub control_policy: ControlPolicy,
     /// UI language override. English is currently the supported UI language.
@@ -88,6 +91,7 @@ impl Default for AppConfig {
         Self {
             theme: "btop".to_string(),
             hidden_agents: Vec::new(),
+            claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
             control_policy: ControlPolicy::default(),
             language: String::new(),
@@ -131,6 +135,10 @@ fn parse_config_content(content: &str) -> AppConfig {
             };
             if key == "hidden_agents" {
                 config.hidden_agents = parse_string_array(val);
+                continue;
+            }
+            if key == "claude_config_dirs" {
+                config.claude_config_dirs = parse_path_array(val);
                 continue;
             }
             let val = val.trim_matches('"').trim_matches('\'');
@@ -186,6 +194,27 @@ fn parse_string_array(raw: &str) -> Vec<String> {
         .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+fn parse_path_array(raw: &str) -> Vec<PathBuf> {
+    parse_string_array(raw)
+        .into_iter()
+        .map(|s| expand_home_path(&s))
+        .collect()
+}
+
+fn expand_home_path(raw: &str) -> PathBuf {
+    if raw == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
 }
 
 pub fn save_theme(name: &str) -> Result<(), String> {
@@ -277,6 +306,23 @@ mod tests {
         assert!(parse_string_array(r#"["a",,]"#)
             .iter()
             .all(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn parse_path_array_expands_home_relative_entries() {
+        let home = dirs::home_dir().unwrap();
+        let paths = parse_path_array(r#"["~/.claude-personal", "/tmp/.claude-work"]"#);
+
+        assert_eq!(paths[0], home.join(".claude-personal"));
+        assert_eq!(paths[1], PathBuf::from("/tmp/.claude-work"));
+    }
+
+    #[test]
+    fn parse_config_content_loads_claude_config_dirs() {
+        let home = dirs::home_dir().unwrap();
+        let cfg = parse_config_content(r#"claude_config_dirs = ["~/.claude-personal"]"#);
+
+        assert_eq!(cfg.claude_config_dirs, vec![home.join(".claude-personal")]);
     }
 
     fn theme_update(name: &str) -> Vec<(&'static str, String)> {

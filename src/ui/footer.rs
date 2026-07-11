@@ -50,7 +50,6 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         return;
     }
 
-    let has_tmux = std::env::var("TMUX").is_ok();
     let compact = area.width <= 80;
     let ultra_compact = area.width <= 70;
 
@@ -61,7 +60,7 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             Style::default().fg(theme.main_fg),
         ),
     ];
-    if has_tmux && !ultra_compact {
+    if !ultra_compact {
         spans.push(Span::styled("↵", Style::default().fg(theme.hi_fg)));
         spans.push(Span::styled(
             format!(" {} ", t("footer.jump")),
@@ -184,4 +183,41 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PanelVisibility;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn footer_renders_concise_cmux_socket_failure() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.set_status("cmux: socket broken; restart cmux".to_string());
+
+        let backend = TestBackend::new(120, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_footer(
+                    f,
+                    &app,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 120,
+                        height: 1,
+                    },
+                    &app.theme,
+                )
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        assert!(text.contains("cmux: socket broken; restart cmux"));
+        assert!(!text.contains("Broken pipe"));
+        assert!(!text.contains("select-workspace"));
+    }
 }

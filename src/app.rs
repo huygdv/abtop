@@ -15,6 +15,7 @@ use crate::task_graph::{GraphNodeKind, TaskGraph};
 use crate::theme::Theme;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -38,14 +39,15 @@ fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
 }
 
 /// Outcome of an Enter-key jump attempt. Distinct from `Option<String>` so
-/// callers (notably `--exit-on-jump`) can tell a real tmux jump apart from
-/// a no-op (outside tmux, or empty session list).
+/// callers (notably `--exit-on-jump`) can tell a real terminal jump apart from
+/// a no-op (unsupported terminal, or empty session list).
+#[derive(Debug, PartialEq, Eq)]
 pub enum JumpOutcome {
-    /// Actually switched to a tmux pane.
+    /// Actually switched to a terminal pane/tab/window.
     Jumped,
-    /// Tried to jump in tmux but no pane owns the session's PID.
+    /// Tried to jump through an applicable backend, but the focus command failed.
     Failed(String),
-    /// Not in tmux, or nothing selected — nothing happened.
+    /// Unsupported terminal, or nothing selected — nothing happened.
     NoOp,
 }
 
@@ -210,7 +212,7 @@ impl WorkspaceProject {
                 SessionStatus::Thinking | SessionStatus::Executing => entry.active_count += 1,
                 SessionStatus::Waiting => entry.waiting_count += 1,
                 SessionStatus::RateLimited => entry.rate_limited_count += 1,
-                SessionStatus::Done => {}
+                SessionStatus::Done | SessionStatus::Unknown => {}
             }
             entry.max_context_percent = entry.max_context_percent.max(session.context_percent);
             entry.total_tokens = entry.total_tokens.saturating_add(session.active_tokens());
@@ -489,15 +491,27 @@ impl App {
         Self::new_with_config_and_policy(theme, hidden_agents, panels, ControlPolicy::default())
     }
 
+    #[cfg(test)]
     pub fn new_with_config_and_policy(
         theme: Theme,
         hidden_agents: &[String],
         panels: crate::config::PanelVisibility,
         control_policy: ControlPolicy,
     ) -> Self {
+        Self::new_with_config_full(theme, hidden_agents, panels, control_policy, &[])
+    }
+
+    pub(crate) fn new_with_config_full(
+        theme: Theme,
+        hidden_agents: &[String],
+        panels: crate::config::PanelVisibility,
+        control_policy: ControlPolicy,
+        claude_config_dirs: &[PathBuf],
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let summaries = load_summary_cache();
-        let mut collector = MultiCollector::with_hidden(hidden_agents);
+        let mut collector =
+            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
         collector.set_mcp_suppress(true);
         Self {
             sessions: Vec::new(),
@@ -932,7 +946,21 @@ impl App {
         self.status_msg = Some((msg, Instant::now()));
     }
 
+    /// Full refresh used by the TUI: collect monitored data, then generate and
+    /// retry session summaries. Equivalent to [`App::tick_no_summaries`] followed
+    /// by [`App::drain_and_retry_summaries`].
     pub fn tick(&mut self) {
+        self.tick_no_summaries();
+        self.drain_and_retry_summaries();
+    }
+
+    /// Refresh all monitored data WITHOUT spawning background summary jobs.
+    ///
+    /// `tick` additionally calls [`App::drain_and_retry_summaries`], which
+    /// shells out to `claude --print` to generate session titles. Headless
+    /// consumers (e.g. the web snapshot API) call this variant so they never
+    /// spawn subprocesses or consume the user's Claude quota.
+    pub fn tick_no_summaries(&mut self) {
         self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
         self.sessions = self.collector.collect();
         self.orphan_ports = self.collector.orphan_ports.clone();
@@ -1174,7 +1202,6 @@ impl App {
             self.set_status("Kill session control disabled by local policy".to_string());
             return;
         }
-
         if self.sessions.is_empty() {
             record_audit(&AuditEvent::new(
                 "kill-session",
@@ -1210,7 +1237,7 @@ impl App {
             .cloned()
             .unwrap_or_else(|| format!("PID {pid}"));
 
-        if status == SessionStatus::Done {
+        if matches!(status, SessionStatus::Done | SessionStatus::Unknown) {
             self.kill_confirm = None;
             record_audit(&AuditEvent::new(
                 "kill-session",
@@ -1236,11 +1263,13 @@ impl App {
                     Some("double-confirmed by user"),
                 ));
 
-                // Confirmed: verify PID still runs an expected agent before mutation.
+                // Confirmed: verify PID still runs a killable agent before
+                // mutation. `is_killable_agent_command` also excludes the
+                // Codex Desktop `app-server` process (upstream bugfix).
                 let current_command = current_process_command(pid);
                 let verified = current_command
                     .as_deref()
-                    .is_some_and(is_supported_agent_command);
+                    .is_some_and(is_killable_agent_command);
                 if !verified {
                     record_audit(&AuditEvent::new(
                         "kill-session",
@@ -2248,65 +2277,16 @@ impl App {
         serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
     }
 
-    /// Jump to the terminal running the selected session's Claude process.
-    /// In tmux: switch to the pane. Otherwise: no-op.
+    /// Jump to the terminal running the selected session's agent process.
+    /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
+    /// see [`crate::jump`]. No-op when nothing is selected or no backend
+    /// recognizes the process.
     pub fn jump_to_session(&mut self) -> JumpOutcome {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
-        if std::env::var("TMUX").is_err() {
-            return JumpOutcome::NoOp;
-        }
         let target_pid = self.sessions[self.selected].pid;
-        match self.jump_via_tmux(target_pid) {
-            None => JumpOutcome::Jumped,
-            Some(msg) => JumpOutcome::Failed(msg),
-        }
-    }
-
-    fn jump_via_tmux(&self, target_pid: u32) -> Option<String> {
-        let output = std::process::Command::new("tmux")
-            .args([
-                "list-panes",
-                "-a",
-                "-F",
-                "#{pane_pid} #{session_name}:#{window_index}.#{pane_index}",
-            ])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        for line in stdout.lines() {
-            let mut parts = line.splitn(2, ' ');
-            let pane_pid: u32 = match parts.next().and_then(|p| p.parse().ok()) {
-                Some(p) => p,
-                None => continue,
-            };
-            let pane_target = match parts.next() {
-                Some(t) => t,
-                None => continue,
-            };
-
-            if is_descendant_of(target_pid, pane_pid) {
-                // Switch tmux client to the target session (needed for cross-session jumps)
-                if let Some(session_name) = pane_target.split(':').next() {
-                    let _ = std::process::Command::new("tmux")
-                        .args(["switch-client", "-t", session_name])
-                        .status();
-                }
-                if let Some(window) = pane_target.split('.').next() {
-                    let _ = std::process::Command::new("tmux")
-                        .args(["select-window", "-t", window])
-                        .status();
-                }
-                let _ = std::process::Command::new("tmux")
-                    .args(["select-pane", "-t", pane_target])
-                    .status();
-                return None; // success
-            }
-        }
-
-        Some("pane not found".to_string())
+        crate::jump::run_jump(target_pid)
     }
 
     /// Get the display summary for a session: cached/generated summary > pending dots > safe fallback.
@@ -2477,49 +2457,6 @@ fn load_summary_cache() -> HashMap<String, String> {
     }
 }
 
-/// Check if `target` PID is a descendant of `ancestor` PID by walking the process tree.
-fn is_descendant_of(target: u32, ancestor: u32) -> bool {
-    if target == ancestor {
-        return true;
-    }
-    // Build a pid->ppid map from ps
-    let output = match std::process::Command::new("ps")
-        .args(["-eo", "pid,ppid"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut ppid_map: HashMap<u32, u32> = HashMap::new();
-    for line in stdout.lines().skip(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let (Ok(pid), Ok(ppid)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                ppid_map.insert(pid, ppid);
-            }
-        }
-    }
-    // Walk up from target to see if we reach ancestor
-    let mut current = target;
-    let mut depth = 0;
-    while depth < 50 {
-        if let Some(&parent) = ppid_map.get(&current) {
-            if parent == ancestor {
-                return true;
-            }
-            if parent == 0 || parent == 1 || parent == current {
-                return false;
-            }
-            current = parent;
-            depth += 1;
-        } else {
-            return false;
-        }
-    }
-    false
-}
-
 fn save_summary_cache(summaries: &HashMap<String, String>) {
     let path = cache_path();
     let _ = std::fs::create_dir_all(cache_dir());
@@ -2646,6 +2583,7 @@ fn workspace_export_status(status: &SessionStatus) -> &'static str {
         SessionStatus::Executing => "work",
         SessionStatus::Waiting => "wait",
         SessionStatus::RateLimited => "rate",
+        SessionStatus::Unknown => "unknown",
         SessionStatus::Done => "done",
     }
 }
@@ -2656,6 +2594,7 @@ fn workspace_export_idle_text(status: &SessionStatus) -> &'static str {
         SessionStatus::Executing => "working",
         SessionStatus::Waiting => "waiting for input",
         SessionStatus::RateLimited => "rate limited",
+        SessionStatus::Unknown => "status unknown",
         SessionStatus::Done => "finished",
     }
 }
@@ -2746,6 +2685,11 @@ fn sorted_values(values: HashSet<String>) -> Vec<String> {
     values
 }
 
+fn is_killable_agent_command(cmd: &str) -> bool {
+    is_supported_agent_command(cmd)
+        && !(crate::collector::process::cmd_has_binary(cmd, "codex") && cmd.contains(" app-server"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2786,6 +2730,7 @@ mod tests {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             file_accesses: vec![],
+            config_root: String::new(),
             git_added: 0,
             git_modified: 0,
         }
@@ -2796,8 +2741,10 @@ mod tests {
             source: source.to_string(),
             five_hour_pct: Some(pct),
             five_hour_resets_at: None,
+            five_hour_window_minutes: Some(300),
             seven_day_pct: None,
             seven_day_resets_at: None,
+            seven_day_window_minutes: None,
             updated_at: None,
         }
     }
@@ -3686,5 +3633,14 @@ mod tests {
     fn terminate_process_rejects_pid_zero() {
         assert!(!terminate_process(0, true));
         assert!(!terminate_process(0, false));
+    }
+
+    #[test]
+    fn killable_agent_command_rejects_codex_app_server() {
+        assert!(is_killable_agent_command("codex --resume abc"));
+        assert!(is_killable_agent_command("/usr/local/bin/claude"));
+        assert!(!is_killable_agent_command(
+            "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
+        ));
     }
 }

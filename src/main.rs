@@ -8,6 +8,7 @@ mod diagnostics;
 mod doctor;
 mod evidence;
 mod host_info;
+mod jump;
 mod locale;
 mod model;
 mod roadmap;
@@ -133,11 +134,12 @@ fn main() -> io::Result<()> {
             policy.allow_dispatch_codex = true;
             policy.allow_dispatch_opencode = true;
         }
-        let mut app = App::new_with_config_and_policy(
+        let mut app = App::new_with_config_full(
             initial_theme.unwrap_or_default(),
             &cfg.hidden_agents,
             cfg.panels,
             policy,
+            &cfg.claude_config_dirs,
         );
         if demo_mode {
             demo::populate_demo(&mut app);
@@ -157,11 +159,12 @@ fn main() -> io::Result<()> {
         || handoff
     {
         log_info!("snapshot mode demo={}", demo_mode);
-        let mut app = App::new_with_config_and_policy(
+        let mut app = App::new_with_config_full(
             initial_theme.unwrap_or_default(),
             &cfg.hidden_agents,
             cfg.panels,
             cfg.control_policy,
+            &cfg.claude_config_dirs,
         );
         if demo_mode {
             demo::populate_demo(&mut app);
@@ -209,6 +212,7 @@ fn main() -> io::Result<()> {
         &cfg.hidden_agents,
         cfg.panels,
         cfg.control_policy,
+        &cfg.claude_config_dirs,
     );
 
     // Always attempt both cleanup steps regardless of app result
@@ -226,6 +230,7 @@ fn main() -> io::Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     demo_mode: bool,
@@ -234,12 +239,14 @@ fn run_app(
     hidden_agents: &[String],
     panels: config::PanelVisibility,
     control_policy: config::ControlPolicy,
+    claude_config_dirs: &[std::path::PathBuf],
 ) -> io::Result<()> {
-    let mut app = App::new_with_config_and_policy(
+    let mut app = App::new_with_config_full(
         initial_theme.unwrap_or_default(),
         hidden_agents,
         panels,
         control_policy,
+        claude_config_dirs,
     );
     if demo_mode {
         demo::populate_demo(&mut app);
@@ -690,6 +697,7 @@ fn print_snapshot(app: &App) {
             model::SessionStatus::Thinking => "◉ Think",
             model::SessionStatus::Executing => "● Exec",
             model::SessionStatus::Waiting => "◌ Wait",
+            model::SessionStatus::Unknown => "? Unknown",
             model::SessionStatus::RateLimited => "⏳ Rate",
             model::SessionStatus::Done => "✓ Done",
         };

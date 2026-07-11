@@ -2,15 +2,17 @@ use super::process::{self, ProcInfo};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
-use std::process::Command;
-use std::time::SystemTime;
+use std::process::{Command, Stdio};
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+use std::time::Instant;
+use std::time::{Duration, SystemTime};
 
-/// Active-thread mtime threshold: a rollout written within the last
+/// Active-thread mtime threshold: a rollout written within the last 30 minutes
 /// ACTIVE_MTIME_SECS counts as "active". File-descriptor presence alone
 /// would overcount — `codex mcp-server` keeps fds open for hours after
 /// a thread last wrote (so it can resume on demand), so we need a
 /// freshness signal in addition to fd presence.
-pub const ACTIVE_MTIME_SECS: u64 = 30;
+pub const ACTIVE_MTIME_SECS: u64 = 30 * 60;
 
 /// One open `rollout-*.jsonl` fd held by an mcp-server process.
 #[derive(Clone, Debug)]
@@ -263,22 +265,114 @@ pub(crate) fn map_pid_to_rollouts(pids: &[u32]) -> HashMap<u32, Vec<PathBuf>> {
         let output = Command::new("lsof").args(&args).output().ok();
         if let Some(output) = output {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut current_pid: Option<u32> = None;
-            for line in stdout.lines() {
-                if let Some(pid_str) = line.strip_prefix('p') {
-                    current_pid = pid_str.parse::<u32>().ok();
-                } else if let Some(name) = line.strip_prefix('n') {
-                    if let Some(pid) = current_pid {
-                        let path = PathBuf::from(name);
-                        if is_rollout_path(&path) {
-                            map.entry(pid).or_default().push(path);
-                        }
+            map = parse_lsof_rollout_output(&stdout);
+        }
+    }
+
+    map
+}
+
+pub(crate) fn map_pid_to_rollouts_with_timeout_and_pid_slot(
+    pids: &[u32],
+    timeout: Duration,
+    child_pid_slot: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+) -> Option<HashMap<u32, Vec<PathBuf>>> {
+    if pids.is_empty() {
+        return Some(HashMap::new());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let _ = (timeout, child_pid_slot);
+        Some(map_pid_to_rollouts(pids))
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+    {
+        let pid_args: Vec<String> = pids.iter().map(|p| format!("-p{}", p)).collect();
+        let mut args = vec!["-F", "pn"];
+        for pa in &pid_args {
+            args.push(pa);
+        }
+
+        let output_file = tempfile::NamedTempFile::new().ok()?;
+        let output_for_child = output_file.reopen().ok()?;
+        let mut child = match Command::new("lsof")
+            .args(&args)
+            .stdout(Stdio::from(output_for_child))
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return None,
+        };
+        let child_pid = child.id();
+        if let Some(slot) = &child_pid_slot {
+            slot.store(child_pid, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    if let Some(slot) = &child_pid_slot {
+                        slot.store(0, std::sync::atomic::Ordering::SeqCst);
                     }
+                    let stdout = std::fs::read_to_string(output_file.path()).ok();
+                    return stdout.map(|s| parse_lsof_rollout_output(&s));
+                }
+                Ok(None) if started.elapsed() >= timeout => {
+                    if let Some(slot) = &child_pid_slot {
+                        slot.store(0, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let _ = Command::new("kill")
+                        .args(["-9", &child_pid.to_string()])
+                        .status();
+                    let _ = child.wait();
+                    return None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => {
+                    if let Some(slot) = &child_pid_slot {
+                        slot.store(0, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    return None;
                 }
             }
         }
     }
+}
 
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+fn kill_pid(pid: u32) {
+    if pid != 0 {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn kill_pid(_pid: u32) {}
+
+pub(crate) fn kill_rollout_scan_child(pid: u32) {
+    kill_pid(pid);
+}
+
+#[cfg(any(test, all(not(target_os = "linux"), not(target_os = "windows"))))]
+pub(crate) fn parse_lsof_rollout_output(stdout: &str) -> HashMap<u32, Vec<PathBuf>> {
+    let mut map: HashMap<u32, Vec<PathBuf>> = HashMap::new();
+    let mut current_pid: Option<u32> = None;
+    for line in stdout.lines() {
+        if let Some(pid_str) = line.strip_prefix('p') {
+            current_pid = pid_str.parse::<u32>().ok();
+        } else if let Some(name) = line.strip_prefix('n') {
+            if let Some(pid) = current_pid {
+                let path = PathBuf::from(name);
+                if is_rollout_path(&path) {
+                    map.entry(pid).or_default().push(path);
+                }
+            }
+        }
+    }
     map
 }
 
@@ -359,7 +453,7 @@ mod tests {
         let now = SystemTime::now();
         let stale = McpRollout {
             path: PathBuf::from("/x"),
-            mtime: Some(now - std::time::Duration::from_secs(120)),
+            mtime: Some(now - std::time::Duration::from_secs(31 * 60)),
             size_bytes: 0,
         };
         let fresh = McpRollout {
@@ -369,5 +463,33 @@ mod tests {
         };
         assert!(!stale.is_active(now, ACTIVE_MTIME_SECS));
         assert!(fresh.is_active(now, ACTIVE_MTIME_SECS));
+    }
+
+    #[test]
+    fn parses_lsof_rollout_output_for_multiple_pids_and_paths() {
+        let stdout = "\
+p100
+n/Users/me/.codex/sessions/2026/05/29/rollout-a.jsonl
+n/Users/me/.codex/sessions/2026/05/29/not-a-rollout.txt
+p200
+n/Users/me/.codex/sessions/2026/05/29/rollout-b.jsonl
+n/Users/me/.codex/sessions/2026/05/29/rollout-c.jsonl
+";
+
+        let parsed = parse_lsof_rollout_output(stdout);
+
+        assert_eq!(
+            parsed.get(&100),
+            Some(&vec![PathBuf::from(
+                "/Users/me/.codex/sessions/2026/05/29/rollout-a.jsonl"
+            )])
+        );
+        assert_eq!(
+            parsed.get(&200),
+            Some(&vec![
+                PathBuf::from("/Users/me/.codex/sessions/2026/05/29/rollout-b.jsonl"),
+                PathBuf::from("/Users/me/.codex/sessions/2026/05/29/rollout-c.jsonl"),
+            ])
+        );
     }
 }

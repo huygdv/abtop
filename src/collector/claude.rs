@@ -49,22 +49,30 @@ struct ProcessOpenPaths {
 pub struct ClaudeCollector {
     /// All known config directories to scan for sessions.
     config_dirs: Vec<ConfigDir>,
+    /// User-configured Claude config directories from abtop config.
+    configured_config_dirs: Vec<PathBuf>,
     /// Cached transcript parse results keyed by session_id.
     /// On each tick, only new bytes since `new_offset` are parsed.
     transcript_cache: HashMap<String, TranscriptResult>,
 }
 
 impl ClaudeCollector {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_configured_dirs(Vec::new())
+    }
+
+    pub fn with_configured_dirs(configured_config_dirs: Vec<PathBuf>) -> Self {
         Self {
             config_dirs: Vec::new(),
+            configured_config_dirs,
             transcript_cache: HashMap::new(),
         }
     }
 
-    /// Discover all unique Claude config directories by reading
-    /// /proc/<pid>/environ for each running Claude process.
-    /// Always includes the default (~/.claude) and CLAUDE_CONFIG_DIR if set.
+    /// Discover unique Claude config directories from defaults, configured
+    /// profile roots, home sibling profiles, and process environment/open-file
+    /// signals when the platform exposes them.
     fn refresh_config_dirs(&mut self, process_info: &HashMap<u32, process::ProcInfo>) {
         // BTreeSet for deterministic iteration order across runs.
         let mut seen = std::collections::BTreeSet::new();
@@ -72,6 +80,16 @@ impl ClaudeCollector {
         // Always include the default directory
         let default = dirs::home_dir().unwrap_or_default().join(".claude");
         seen.insert(default);
+
+        if let Some(home) = dirs::home_dir() {
+            seen.extend(discover_home_claude_config_dirs(&home));
+        }
+
+        for dir in &self.configured_config_dirs {
+            if is_claude_config_root(dir) {
+                seen.insert(dir.clone());
+            }
+        }
 
         // Include CLAUDE_CONFIG_DIR from abtop's own environment
         if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
@@ -554,8 +572,11 @@ impl ClaudeCollector {
         };
 
         let configured_model = read_configured_model(&sf.cwd);
-        let context_window =
-            context_window_for_model(&model, &configured_model, max_context_tokens);
+        let context_window = crate::collector::context_window_for_model(
+            &model,
+            &configured_model,
+            max_context_tokens,
+        );
         let context_percent = if context_window > 0 {
             (last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
@@ -656,6 +677,7 @@ impl ClaudeCollector {
             pending_since_ms: cached.last_assistant_ts_ms,
             thinking_since_ms: cached.last_user_ts_ms,
             file_accesses,
+            config_root: super::abbrev_path(&config.base_dir()),
         })
     }
 
@@ -769,6 +791,12 @@ impl ClaudeCollector {
         }
 
         (file_count, line_count)
+    }
+}
+
+impl Default for ClaudeCollector {
+    fn default() -> Self {
+        Self::with_configured_dirs(Vec::new())
     }
 }
 
@@ -970,6 +998,27 @@ fn candidate_config_roots_from_path(path: &Path) -> Vec<PathBuf> {
 
 fn is_claude_config_root(path: &Path) -> bool {
     path.join("sessions").is_dir() && path.join("projects").is_dir()
+}
+
+fn discover_home_claude_config_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut roots = std::collections::BTreeSet::new();
+    let Ok(entries) = fs::read_dir(home) else {
+        return Vec::new();
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name != ".claude" && !name.starts_with(".claude-") {
+            continue;
+        }
+        let path = entry.path();
+        if is_claude_config_root(&path) {
+            roots.insert(path);
+        }
+    }
+
+    roots.into_iter().collect()
 }
 
 /// Per-tick session-discovery state shared across all `load_session` calls
@@ -1847,21 +1896,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn context_window_for_model(
-    transcript_model: &str,
-    configured_model: &str,
-    max_context_tokens: u64,
-) -> u64 {
-    if transcript_model.contains("[1m]")
-        || configured_model.contains("[1m]")
-        || max_context_tokens > 200_000
-    {
-        1_000_000
-    } else {
-        200_000
-    }
-}
-
 /// Returns the ordered list of Claude Code settings files to check, from
 /// highest to lowest priority, matching Claude Code's own resolution order:
 /// 1. `{cwd}/.claude/settings.local.json`
@@ -1981,15 +2015,14 @@ fn read_env_var_from_proc(pid: u32, var_name: &str) -> Option<String> {
 /// Stub for non-Linux platforms where /proc is not available.
 /// Windows has no equivalent way to read another process's environment block
 /// without elevated privileges, so per-process `CLAUDE_CONFIG_DIR` overrides
-/// can't be detected — abtop's own env (resolved in `refresh_config_dirs`)
-/// is the only signal there.
+/// can't be detected. Configured roots, home sibling profile discovery, and
+/// abtop's own env are the portable signals there.
 ///
 /// On macOS, `ps eww`/`KERN_PROCARGS2` are unreliable: the kernel truncates
 /// the env block to ~120 chars for non-root callers, so `CLAUDE_CONFIG_DIR`
-/// is rarely visible. Discovery of profile sessions instead piggybacks on
-/// `libproc` open-FD inspection (see `discover_active_session_paths`), which
-/// reads the actual session-file paths a Claude process has open and infers
-/// the config dir from there.
+/// is rarely visible. Discovery of profile sessions can still use configured
+/// roots, home sibling profiles, and `libproc` open-FD inspection when Claude
+/// exposes session/project paths.
 #[cfg(not(target_os = "linux"))]
 fn read_env_var_from_proc(_pid: u32, _var_name: &str) -> Option<String> {
     None
@@ -2008,13 +2041,19 @@ mod tests {
     }
 
     fn write_session_file(path: &Path, pid: u32, session_id: &str, cwd: &Path) {
-        let payload = serde_json::json!({
-            "pid": pid,
-            "sessionId": session_id,
-            "cwd": cwd.to_string_lossy(),
-            "startedAt": 1774715116826_u64,
-        });
-        std::fs::write(path, payload.to_string()).unwrap();
+        // Serialize via serde_json so Windows backslash paths are escaped
+        // correctly instead of producing invalid JSON.
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": session_id,
+                "cwd": cwd.to_str().unwrap(),
+                "startedAt": 1774715116826u64,
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     fn write_transcript(projects: &Path, cwd: &Path, session_id: &str, prompt: &str) -> PathBuf {
@@ -2368,6 +2407,44 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].base_dir(), profile);
+    }
+
+    #[test]
+    fn test_discover_home_claude_config_dirs_finds_profile_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let personal = temp.path().join(".claude-personal");
+        let work = temp.path().join(".claude-work-team");
+        let incomplete = temp.path().join(".claude-cache");
+        std::fs::create_dir_all(personal.join("sessions")).unwrap();
+        std::fs::create_dir_all(personal.join("projects")).unwrap();
+        std::fs::create_dir_all(work.join("sessions")).unwrap();
+        std::fs::create_dir_all(work.join("projects")).unwrap();
+        std::fs::create_dir_all(incomplete.join("sessions")).unwrap();
+
+        let discovered = discover_home_claude_config_dirs(temp.path());
+
+        assert!(discovered.contains(&personal));
+        assert!(discovered.contains(&work));
+        assert!(!discovered.contains(&incomplete));
+    }
+
+    #[test]
+    fn test_refresh_config_dirs_includes_configured_profile_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude-personal");
+        std::fs::create_dir_all(profile.join("sessions")).unwrap();
+        std::fs::create_dir_all(profile.join("projects")).unwrap();
+
+        let mut collector = ClaudeCollector::with_configured_dirs(vec![profile.clone()]);
+        collector.refresh_config_dirs(&HashMap::new());
+
+        assert!(
+            collector
+                .config_dirs
+                .iter()
+                .any(|config| config.base_dir() == profile),
+            "configured Claude profile root was not retained"
+        );
     }
 
     #[test]
@@ -3041,27 +3118,30 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     fn test_context_window_for_model() {
         // Base model with low token usage → 200K
         assert_eq!(
-            context_window_for_model("claude-opus-4-6", "", 50_000),
+            crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000),
             200_000
         );
         // Explicit [1m] suffix in transcript model → 1M regardless of token count
         assert_eq!(
-            context_window_for_model("claude-opus-4-6[1m]", "", 0),
+            crate::collector::context_window_for_model("claude-opus-4-6[1m]", "", 0),
             1_000_000
         );
         // [1m] in configured model (from settings.json) → 1M even if transcript lacks it
         assert_eq!(
-            context_window_for_model("claude-sonnet-4-6", "sonnet[1m]", 0),
+            crate::collector::context_window_for_model("claude-sonnet-4-6", "sonnet[1m]", 0),
             1_000_000
         );
         assert_eq!(
-            context_window_for_model("claude-sonnet-4-6", "", 100_000),
+            crate::collector::context_window_for_model("claude-sonnet-4-6", "", 100_000),
             200_000
         );
-        assert_eq!(context_window_for_model("unknown-model", "", 0), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("unknown-model", "", 0),
+            200_000
+        );
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(
-            context_window_for_model("claude-opus-4-6", "", 250_000),
+            crate::collector::context_window_for_model("claude-opus-4-6", "", 250_000),
             1_000_000
         );
     }

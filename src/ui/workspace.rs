@@ -640,6 +640,7 @@ fn workspace_status(
         SessionStatus::Executing => ("work", theme.hi_fg),
         SessionStatus::Waiting => ("wait", theme.main_fg),
         SessionStatus::RateLimited => ("rate", theme.warning_fg),
+        SessionStatus::Unknown => ("?", theme.inactive_fg),
         SessionStatus::Done => ("done", theme.inactive_fg),
     }
 }
@@ -650,6 +651,7 @@ fn workspace_idle_text(status: &SessionStatus) -> &'static str {
         SessionStatus::Executing => "working",
         SessionStatus::Waiting => "waiting for input",
         SessionStatus::RateLimited => "rate limited",
+        SessionStatus::Unknown => "status unknown",
         SessionStatus::Done => "finished",
     }
 }

@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,7 +33,7 @@ pub struct FileAccess {
 pub const MAX_FILE_ACCESSES: usize = 1000;
 
 /// Account-level rate limit info (shared across all sessions).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RateLimitInfo {
     /// "claude" or "codex"
     pub source: String,
@@ -41,15 +41,22 @@ pub struct RateLimitInfo {
     pub five_hour_pct: Option<f64>,
     /// 5-hour window reset timestamp (epoch seconds)
     pub five_hour_resets_at: Option<u64>,
+    /// 5-hour slot duration in minutes, when reported by the source.
+    pub five_hour_window_minutes: Option<u64>,
     /// 7-day window usage percentage (0-100)
+    ///
+    /// Historical field name kept for compatibility; Codex may use this slot
+    /// for a longer account-level window such as 30 days.
     pub seven_day_pct: Option<f64>,
     /// 7-day window reset timestamp (epoch seconds)
     pub seven_day_resets_at: Option<u64>,
+    /// Long-window slot duration in minutes, when reported by the source.
+    pub seven_day_window_minutes: Option<u64>,
     /// When this data was last updated
     pub updated_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum SessionStatus {
     /// Model is generating a response (last_user_ts_ms > 0)
     Thinking,
@@ -57,6 +64,8 @@ pub enum SessionStatus {
     Executing,
     /// Idle, waiting for user input or permission prompt
     Waiting,
+    /// Session appears recent, but process ownership is not confirmed
+    Unknown,
     /// Waiting due to rate limit
     RateLimited,
     /// Session finished
@@ -70,7 +79,7 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChildProcess {
     pub pid: u32,
     pub command: String,
@@ -79,7 +88,7 @@ pub struct ChildProcess {
 }
 
 /// A port left open by a process whose parent session has ended.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OrphanPort {
     pub port: u16,
     pub pid: u32,
@@ -180,6 +189,10 @@ pub struct AgentSession {
     pub thinking_since_ms: u64,
     /// File access audit log: every file read/written/edited by the agent.
     pub file_accesses: Vec<FileAccess>,
+    /// Config root directory for this session's agent (home-abbreviated, e.g. "~/.claude-work").
+    /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
+    /// For OpenCode: the data directory containing opencode.db.
+    pub config_root: String,
 }
 
 impl AgentSession {
@@ -288,6 +301,7 @@ mod tests {
             pending_since_ms: 0,
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
+            config_root: String::new(),
         }
     }
 

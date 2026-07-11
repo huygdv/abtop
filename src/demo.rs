@@ -198,6 +198,7 @@ pub fn populate_demo(app: &mut App) {
             ],
             pending_since_ms: now - 6_000, // 6s ago => bar animates
             thinking_since_ms: 0,
+            config_root: "~/.claude".into(),
             file_accesses: vec![
                 FileAccess {
                     path: "src/checkout/payment.rs".into(),
@@ -305,6 +306,7 @@ pub fn populate_demo(app: &mut App) {
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            config_root: "~/.claude-work".into(),
             file_accesses: vec![],
         },
         AgentSession {
@@ -408,6 +410,7 @@ pub fn populate_demo(app: &mut App) {
             // animates. 1s offset keeps the bar visibly growing against the
             // session's 2.8s max tool duration before it caps at 100%.
             thinking_since_ms: now - 1_000,
+            config_root: "~/.claude".into(),
             file_accesses: vec![],
         },
         AgentSession {
@@ -461,6 +464,7 @@ pub fn populate_demo(app: &mut App) {
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            config_root: "~/.codex".into(),
             file_accesses: vec![],
         },
         AgentSession {
@@ -502,6 +506,7 @@ pub fn populate_demo(app: &mut App) {
             tool_calls: vec![],
             pending_since_ms: 0,
             thinking_since_ms: 0,
+            config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
         },
     ];
@@ -534,16 +539,20 @@ pub fn populate_demo(app: &mut App) {
             source: "claude".into(),
             five_hour_pct: Some(35.0),
             five_hour_resets_at: Some(now_secs() + 3 * 3600),
+            five_hour_window_minutes: Some(300),
             seven_day_pct: Some(12.0),
             seven_day_resets_at: Some(now_secs() + 5 * 24 * 3600),
+            seven_day_window_minutes: Some(10_080),
             updated_at: Some(now_secs() - 10),
         },
         RateLimitInfo {
             source: "codex".into(),
             five_hour_pct: Some(9.0),
             five_hour_resets_at: Some(now_secs() + 4 * 3600),
+            five_hour_window_minutes: Some(300),
             seven_day_pct: Some(14.0),
             seven_day_resets_at: Some(now_secs() + 6 * 24 * 3600),
+            seven_day_window_minutes: Some(10_080),
             updated_at: Some(now_secs() - 5),
         },
     ];

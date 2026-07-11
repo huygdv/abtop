@@ -21,6 +21,9 @@ No API keys. No auth.
 
 ### macOS / Linux
 
+> [!IMPORTANT]
+> On Linux, ensure `sqlite3` is installed to enable monitoring for OpenCode sessions.
+
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh | sh
 ```
@@ -33,7 +36,7 @@ cargo install abtop
 
 ### Windows
 
-Native support — no WSL required. Uses `sysinfo` for process info and `netstat -ano` for listening ports.
+Native support — no WSL required. Uses `sysinfo` for process info and host CPU/MEM metrics, and `netstat -ano` for listening ports. Windows has no load average, so LOAD is reported as 0. OpenCode session discovery additionally requires the `sqlite3` CLI (`winget install SQLite.SQLite`); without it abtop prints a one-time warning to stderr.
 
 ```powershell
 powershell -c "irm https://github.com/graykode/abtop/releases/latest/download/abtop-installer.ps1 | iex"
@@ -59,6 +62,7 @@ abtop --setup            # Install rate limit collection hook
 abtop --doctor           # Check local setup and collector health
 abtop --doctor --json    # Print machine-readable diagnostics JSON
 abtop --theme dracula    # Launch with a specific theme
+abtop --mouse            # Enable mouse click/scroll navigation
 ```
 
 Mutating controls require a second keypress within the confirmation window and
@@ -74,13 +78,14 @@ in [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md). Known
 limitations are listed in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md).
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
+Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
 Quota bars show account rate-limit percentage remaining for each provider
 window. They are separate from the session token totals shown in the same panel.
 
-### tmux
+### Terminal Jump
 
-abtop works standalone, but running inside tmux unlocks session jumping — press `Enter` to switch directly to the pane running that agent.
+Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
 
 ```bash
 tmux new -s work
@@ -221,7 +226,7 @@ What is **deliberately deferred** (per `docs/AGENT_HANDOFF.md`):
 | Subagents         |     ✅      |    ❌     |    ❌    |
 | Memory Status     |     ✅      |    ❌     |    ❌    |
 
-OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` and requires `sqlite3` in `PATH`.
+OpenCode support reads the local SQLite database at `~/.local/share/opencode/opencode.db` (also the default location on Windows; `%LOCALAPPDATA%\opencode` and `%APPDATA%\opencode` are probed as fallbacks) and requires `sqlite3` in `PATH` (on Windows: `winget install SQLite.SQLite`).
 
 ## Diagnostics
 
@@ -264,7 +269,11 @@ theme = "btop"
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Useful if you only use one agent and want a cleaner view.
 hidden_agents = ["codex"]
-# UI language. English is the supported project-facing language.
+# Additional Claude Code profile roots to scan.
+# abtop also auto-discovers ~/.claude and ~/.claude-* roots that contain
+# both sessions/ and projects/.
+claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
+# UI language. Omit or leave empty to auto-detect from LANG (e.g. "zh").
 language = "en"
 # Local policy gates for mutating controls.
 allow_kill_sessions = true
@@ -278,7 +287,7 @@ allow_kill_orphan_ports = true
 | Key                | Action                               |
 | ------------------ | ------------------------------------ |
 | `↑`/`↓` or `k`/`j` | Select session                       |
-| `Enter`            | Jump to session terminal (tmux only) |
+| `Enter`            | Jump to session terminal             |
 | `x`                | Confirm kill selected session        |
 | `X`                | Confirm kill all orphan ports        |
 | `t`                | Cycle theme                          |
@@ -286,6 +295,37 @@ allow_kill_orphan_ports = true
 | `Esc`              | Open/close config page               |
 | `q`                | Quit                                 |
 | `r`                | Force refresh                        |
+
+## Library / JSON snapshot
+
+abtop is also a library crate, so local tools can reuse its data-collection
+layer in-process — no re-scanning, no subprocesses — and serialize the same
+state the TUI renders.
+
+```bash
+abtop --json    # one-shot JSON snapshot for scripts
+```
+
+For long-running consumers, build an `App`, refresh it with
+`App::tick_no_summaries()` (which never spawns `claude --print`, so it doesn't
+touch your Claude quota), and call `App::to_snapshot(interval_ms)` to get a
+JSON-serializable [`Snapshot`]:
+
+```rust,no_run
+use abtop::app::App;
+use abtop::{config, theme::Theme};
+
+let cfg = config::load_config();
+let mut app = App::new_with_config_and_claude_dirs(
+    Theme::default(), &cfg.hidden_agents, cfg.panels, &cfg.claude_config_dirs,
+);
+app.tick_no_summaries();
+let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
+```
+
+`App` is not `Send` (it owns the collectors), so keep it on one thread and pass
+the serialized JSON elsewhere. [abtop-web-ui](https://github.com/XKHoshizora/abtop-web-ui)
+is a reference consumer: a local-first web dashboard built on exactly this API.
 
 ## Privacy
 
